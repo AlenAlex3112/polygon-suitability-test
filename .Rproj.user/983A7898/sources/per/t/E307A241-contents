@@ -1,0 +1,286 @@
+library(skimmr)
+library(lubridate)
+library(sf)
+library(h3jsr)
+library(dplyr)
+library(purrr)
+library(glue)
+library(tidyverse)
+library(leaflet)
+library(htmlwidgets)
+
+# --- Configuration ---
+H3_RES <- 7 # Using Resolution 7 as defined in your latest Section 1
+# ==============================================================================
+# SECTION 1: LOAD & PREPARE SPATIAL DATA (Using your H3 conversion)
+# ==============================================================================
+
+# Load Map
+map <- st_read("data/map.geojson", quiet = TRUE)
+
+# Convert Kerala boundary to H3 cells
+map_h3_boundary <- map %>%
+  filter(str_detect(subregion, regex("Kerala", ignore_case = TRUE))) %>%
+  filter(!subregion %in% c(
+    "India--Kerala--Offshore",
+    "India--Kerala--Pelagic"
+  )) %>%
+  st_transform(4326) %>% # H3 requires WGS84
+  polygon_to_cells(
+    res = H3_RES, # H3_RES is defined as 7
+    simple = FALSE
+  )
+
+# --- FIX: Ensure the H3 ID column is correctly named ---
+# 1. Check if the default column 'h3_index' exists
+if ("h3_index" %in% names(map_h3_boundary)) {
+  map_h3_boundary <- map_h3_boundary %>% rename(h3_id = h3_index)
+} else if ("h3" %in% names(map_h3_boundary)) {
+  # Check for another common default name
+  map_h3_boundary <- map_h3_boundary %>% rename(h3_id = h3)
+}
+# Assuming the H3 ID column is now named 'h3_id'
+
+# Get the full vector of H3 IDs covering Kerala
+grid_h3_ids <- map_h3_boundary %>% pull(h3_id)
+
+# Create the SF object for the full H3 grid of Kerala (for plotting empty zones later)
+grid_sf <- grid_h3_ids %>%
+  cell_to_polygon() %>%
+  st_as_sf()
+st_write(grid_sf, "kerala_h3_grid_res7.geojson", append = FALSE, quiet = TRUE)
+
+# The variable 'grid' from your original code is now replaced by 'grid_h3_ids' and 'grid_sf'
+
+# ==============================================================================
+# SECTION 2: LOAD & PREPARE BIRD DATA (Kept unchanged)
+# ==============================================================================
+
+load("data/KL_data.RData") # Load if exists, otherwise process from raw
+
+# --- Check if we need to process raw EBD data ---
+if (!exists("data_req")) {
+  # ... [Original data loading and filtering code remains here] ...
+  load("../ebird-datasets/EBD/latest_non-EBD_paths.RData")
+  ebird_rel_param()
+  
+  maindatapath <- glue("../ebird-datasets/EBD/ebd_IN_rel{currel_month_lab}-{currel_year}.RData")
+  load(maindatapath)
+  
+  preimp <- c("COMMON.NAME", "CATEGORY", "REVIEWED","OBSERVATION.COUNT",
+              "STATE","COUNTY", "APPROVED","LATITUDE","LONGITUDE","OBSERVATION.DATE",
+              "ALL.SPECIES.REPORTED","DURATION.MINUTES","EFFORT.DISTANCE.KM",
+              "YEAR", "MONTH", "DAY.M", "GROUP.ID")
+  
+  data_req <- data %>% select(all_of(preimp))
+  rm(data_sed, data)
+  
+  # Filter Data
+  data_req <- data_req %>%
+    filter(STATE == "Kerala") %>%
+    filter(DURATION.MINUTES < 600) %>%
+    filter(EFFORT.DISTANCE.KM < 15) %>%  
+    filter(OBSERVATION.DATE >= as.Date("2010-01-01")) %>% 
+    filter(CATEGORY %in% c("species", "issf")) %>%
+    filter(REVIEWED == 0 | APPROVED == 1) %>% 
+    distinct(GROUP.ID, COMMON.NAME, .keep_all = TRUE)
+  
+  data_req <- data_req %>% select(-REVIEWED, -APPROVED, -CATEGORY, -STATE)
+  
+  save(data_req, file = "data/KL_data.RData")
+}
+
+# ==============================================================================
+# SECTION 3: H3 SPATIAL INDEXING (Replaces all SF Joins with H3)
+# ==============================================================================
+
+# 1. Extract unique checklist locations
+locs <- data_req %>%
+  distinct(GROUP.ID, LATITUDE, LONGITUDE)
+
+# 2. Convert Points to H3 Cell IDs (Replaces st_as_sf and st_join)
+locs$h3_id <- point_to_cell(
+  locs[, c("LONGITUDE", "LATITUDE")], 
+  res = H3_RES, # Use the defined resolution 7
+  simple = TRUE
+)
+
+# 3. Create the H3 Checklist Map
+checklist_h3_map <- locs %>%
+  filter(!is.na(h3_id)) %>%
+  select(GROUP.ID, h3_id) %>%
+  distinct(GROUP.ID, .keep_all = TRUE) 
+
+# 4. Add H3 ID to main data
+data_req <- data_req %>%
+  left_join(checklist_h3_map, by = "GROUP.ID")
+
+# ==============================================================================
+# SECTION 4: PREPARE MAP DATA (DENSITY & CORRELATION)
+# ==============================================================================
+
+# --- A. Species Density Data ---
+grid_counts <- data_req %>%
+  group_by(h3_id) %>%  
+  summarise(unique_species = n_distinct(COMMON.NAME)) %>%
+  filter(!is.na(h3_id))
+
+# --- B. Spatial Correlation Analysis ---
+
+# 1. Filter for complete checklists and valid H3 IDs
+clean_data <- data_req %>%
+  filter(ALL.SPECIES.REPORTED == 1) %>%
+  filter(!is.na(h3_id))
+
+# 2. Calculate Species Ranks per H3 Grid
+grid_stats <- clean_data %>%
+  group_by(h3_id) %>%
+  mutate(total_lists = n_distinct(GROUP.ID)) %>%
+  ungroup() %>%
+  group_by(h3_id, total_lists, COMMON.NAME) %>%
+  summarise(detections = n_distinct(GROUP.ID), .groups = "drop") %>%
+  mutate(frequency = detections / total_lists) %>%
+  group_by(h3_id) %>%
+  arrange(desc(frequency)) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= 100) %>% 
+  ungroup() %>%
+  as.data.frame()
+
+# 3. Prepare H3 ID Vector for Analysis
+valid_h3_ids <- unique(grid_stats$h3_id)
+
+# 4. Define the H3 Correlation Function (uses get_ring for efficiency)
+calc_spatial_corr_h3 <- function(curr_id, all_ids_vec, stats_df) {
+  
+  # H3 Step: Find 6 neighbors using h3jsr (SUPER FAST)
+  nbs <- get_ring(curr_id, ring_size = 1, simple = TRUE)
+  
+  # Filter neighbors to only include those present in our data set
+  valid_nbs <- intersect(nbs, all_ids_vec)
+  if (length(valid_nbs) == 0) return(NA)
+  
+  # Get current species ranks
+  curr_sp <- stats_df %>% 
+    filter(h3_id == curr_id) %>% 
+    select(COMMON.NAME, rank)
+  
+  if (nrow(curr_sp) == 0) return(NA)
+  
+  # Loop through neighbors
+  cor_vals <- map_dbl(valid_nbs, function(nb_id) {
+    nb_sp <- stats_df %>% filter(h3_id == nb_id) %>% select(COMMON.NAME, rank)
+    
+    if (nrow(nb_sp) == 0) return(NA)
+    
+    merged <- inner_join(curr_sp, nb_sp, by = "COMMON.NAME", suffix = c("_cur", "_nb"))
+    
+    if (nrow(merged) < 3) return(NA)
+    
+    cor(merged$rank_cur, merged$rank_nb, method = "spearman")
+  })
+  
+  mean(cor_vals, na.rm = TRUE)
+}
+
+# 5. Run Calculation
+print("Calculating Spatial Correlations... this may take a moment.")
+h3_corr_results <- tibble(
+  h3_id = valid_h3_ids,
+  spatial_corr = map_dbl(valid_h3_ids, 
+                         ~calc_spatial_corr_h3(., valid_h3_ids, grid_stats))
+)
+
+# Clean NaNs
+h3_corr_results$spatial_corr[is.nan(h3_corr_results$spatial_corr)] <- NA
+
+
+# 6. Convert H3 IDs back to Polygons for Plotting
+# Correlation Map
+map_corr <- h3_to_polygon(h3_corr_results, simple = FALSE) %>%
+  inner_join(h3_corr_results, by = "h3_id")
+
+# Density Map
+map_density_h3 <- h3_to_polygon(grid_counts, simple = FALSE) %>%
+  inner_join(grid_counts, by = "h3_id") %>%
+  mutate(unique_species = ifelse(is.na(unique_species), 0, unique_species))
+
+# Empty Grids (Convert all H3 IDs in the study area that have no bird data)
+empty_h3_ids <- grid_h3_ids %>%
+  as_tibble() %>%
+  filter(!value %in% valid_h3_ids) %>%
+  pull(value)
+
+empty_grids_h3 <- h3_to_polygon(empty_h3_ids, simple = FALSE)
+
+# ==============================================================================
+# SECTION 5: GENERATE MASTER LEAFLET MAP
+# ==============================================================================
+
+# Define Palettes
+pal_density <- colorNumeric(palette = "YlOrRd", domain = map_density_h3$unique_species)
+pal_corr    <- colorNumeric(palette = "RdYlBu", domain = c(-1, 1), na.color = "transparent")
+
+m <- leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  
+  # --- Layer 1: Kerala Boundaries (Overlay) ---
+  addPolygons(
+    data = map,
+    fill = FALSE,
+    color = "black",
+    weight = 2,
+    opacity = 1,
+    group = "Kerala Subregions"
+  ) %>%
+  
+  # --- Layer 2: No Data Zones (Grey) ---
+  addPolygons(
+    data = empty_grids_h3,
+    fillColor = "#333333",
+    fillOpacity = 0.5,
+    weight = 1,
+    color = "#444444",
+    group = "No Data Zones"
+  ) %>%
+  
+  # --- Layer 3: Neighborhood Similarity (Correlation) ---
+  addPolygons(
+    data = map_corr %>% filter(!is.na(spatial_corr)),
+    fillColor = ~pal_corr(spatial_corr),
+    fillOpacity = 0.8,
+    weight = 1,
+    color = "white",
+    group = "Neighborhood Similarity",
+    highlightOptions = highlightOptions(weight = 3, color = "cyan", bringToFront = TRUE),
+    label = ~paste0("H3 ID: ", h3_id, " | Similarity: ", round(spatial_corr, 2))
+  ) %>%
+  
+  # --- Layer 4: Species Density (Counts) ---
+  addPolygons(
+    data = map_density_h3,
+    fillColor = ~pal_density(unique_species),
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    fillOpacity = 0.7,
+    group = "Species Density", 
+    label = ~paste0("Species Count: ", unique_species),
+    highlightOptions = highlightOptions(weight = 3, color = "#666", bringToFront = TRUE)
+  ) %>%
+  
+  # --- Legends ---
+  addLegend(pal = pal_corr, values = c(-1, 1), title = "Similarity<br>(Correlation)", position = "bottomright") %>%
+  addLegend(pal = pal_density, values = map_density_h3$unique_species, title = "Species Count", position = "bottomleft") %>%
+  
+  # --- Layer Controls ---
+  addLayersControl(
+    overlayGroups = c("Species Density", "Neighborhood Similarity", "No Data Zones", "Kerala Subregions"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) %>%
+  
+  hideGroup("Species Density")
+
+# Save the Map
+saveWidget(m, file = "Kerala_Bird_Analysis_H3_Map.html", selfcontained = TRUE)
+print("Map saved successfully as Kerala_Bird_Analysis_H3_Map.html")
